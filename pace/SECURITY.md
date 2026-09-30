@@ -1,12 +1,12 @@
 # Security and privacy
 
-PACE is intended for one person on a trusted Windows computer. It listens on loopback, checks request Host/Origin values, and requires a local session cookie plus a CSRF token for changes. Static file access is restricted to the application assets. The interface escapes activity text, and configured race links must use HTTPS.
+PACE is intended for one person on a trusted Windows or macOS computer. It listens on loopback, checks request Host/Origin values, and requires a local session cookie plus a CSRF token for changes. Static file access is restricted to the application assets. The interface escapes activity text, and configured race links must use HTTPS.
 
-These controls do not protect against malware or someone using the same Windows account. The local journal is not encrypted by PACE. Do not expose the development server through a tunnel, on a LAN, or to the internet without designing authentication, authorization, TLS, and hardened hosting first.
+These controls do not protect against malware or someone using the same user account. The local journal is not encrypted by PACE. Do not expose the development server through a tunnel, on a LAN, or to the internet without designing authentication, authorization, TLS, and hardened hosting first.
 
 ## Garmin credentials
 
-Passwords are not saved. Reusable Garmin sessions remain in memory and are written only when Windows DPAPI encryption succeeds. If encryption fails, PACE reports that sign-in will be needed after a restart; it does not save a plaintext session. Disconnect removes a persisted session without deleting runs.
+Passwords are not saved. Reusable Garmin sessions remain in memory and are saved only to OS secret storage: a Windows DPAPI-encrypted file, or a generic-password item in the macOS login Keychain. The session is passed to the Keychain API in-process, never on a command line. On other systems, or if secure storage fails, PACE reports that sign-in will be needed after a restart; it does not save a plaintext session. Disconnect removes a persisted session without deleting runs.
 
 The connector is pinned to garminconnect 0.3.5, which includes the token-file permissions fix for CVE-2026-54447. PACE uses its own encrypted persistence and does not call the connector's affected token-file writer. Dependency audits only cover known, reported issues and should be repeated when dependencies change.
 

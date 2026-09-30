@@ -1,18 +1,32 @@
 import http.client
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from server import Database, GarminSync, AppServer, normalize_garmin, import_file, validate_run, protect, valid_date
+from server import Database, GarminSync, AppServer, DpapiStore, KeychainStore, MemoryOnlyStore, normalize_garmin, import_file, validate_run, protect, valid_date, session_store
 
 def activity(i, distance=5000):
     return {'activityId': i, 'activityType': {'typeKey': 'running'}, 'activityName':'A real run',
             'startTimeLocal':'2026-09-09 07:00:00','distance':distance,'duration':1800,'averageHR':145}
+
+class FakeStore:
+    """Stands in for OS secret storage so tests never touch the real Keychain or DPAPI."""
+    saved_message = 'Saved securely for this test.'
+    def __init__(self, saved=None, deny=False): self.saved, self.deny = saved, deny
+    def save(self, raw):
+        if self.deny: raise OSError(5, 'Access denied')
+        self.saved = raw
+    def load(self):
+        if self.deny: raise OSError(5, 'Access denied')
+        return self.saved
+    def clear(self): self.saved = None
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
@@ -82,30 +96,115 @@ class StorageTests(unittest.TestCase):
         try:
             encrypted=protect(raw)
         except OSError as error:
-            self.skipTest(f'This Windows launch denies DPAPI: error {error.errno}. In-memory fallback tested separately.')
+            self.skipTest(f'Windows DPAPI is unavailable in this environment: error {error.errno}. In-memory fallback tested separately.')
         self.assertNotIn(raw,encrypted)
         self.assertEqual(protect(encrypted,decrypt=True),raw)
 
+    def test_macos_keychain_round_trip(self):
+        if sys.platform != 'darwin':
+            self.skipTest('The macOS Keychain is only available on macOS.')
+        store = KeychainStore('pace-test-' + uuid.uuid4().hex)
+        raw = b'private-session-token-test' * 500
+        try:
+            self.assertIsNone(store.load())
+            store.save(raw)
+            self.assertEqual(store.load(), raw)
+            store.save(raw[::-1])
+            self.assertEqual(store.load(), raw[::-1])
+        except OSError as error:
+            self.skipTest(f'The login Keychain is unavailable in this environment: error {error.errno}.')
+        finally:
+            store.clear()
+        self.assertIsNone(store.load())
+
+    def test_session_store_matches_platform(self):
+        if os.name == 'nt':
+            self.assertIsInstance(session_store(Path(self.tmp.name)), DpapiStore)
+            return
+        with patch('server.sys.platform', 'linux'):
+            self.assertIsInstance(session_store(Path(self.tmp.name)), MemoryOnlyStore)
+        if sys.platform == 'darwin':
+            self.assertIsInstance(session_store(Path(self.tmp.name)), KeychainStore)
+
     def test_denied_encryption_never_writes_plaintext_and_sync_survives(self):
-        sync=GarminSync(self.db)
+        sync=GarminSync(self.db, DpapiStore(Path(self.tmp.name) / 'garmin-session.dpapi'))
         class Fake:
             def dumps(self):return 'SECRET_TOKEN'
         class Wrapper:client=Fake()
         sync.client=Wrapper()
         with patch('server.protect',side_effect=OSError(5,'Access denied')):
             sync.persist()
-        self.assertFalse(sync.tokens.exists())
+        self.assertFalse(sync.store.path.exists())
+        self.assertFalse(sync.store.path.with_suffix('.tmp').exists())
         self.assertFalse(sync.state['session_persisted'])
         self.assertIn('Sync works',sync.state['storage_message'])
+
+    def test_denied_keychain_keeps_session_in_memory(self):
+        sync = GarminSync(self.db, FakeStore(deny=True))
+        class Wrapper: client = type('Fake', (), {'dumps': lambda self: 'SECRET_TOKEN'})()
+        sync.client = Wrapper()
+        sync.persist()
+        self.assertFalse(sync.state['session_persisted'])
+        self.assertIn('Sync works', sync.state['storage_message'])
+
+    def test_session_restored_from_secure_storage_after_restart(self):
+        logins = []
+        class FakeGarmin:
+            def login(self, tokenstore=None): logins.append(tokenstore)
+        sync = GarminSync(self.db, FakeStore(saved=b'{"di_token": "x"}'))
+        with patch('garminconnect.Garmin', FakeGarmin):
+            sync.restore()
+        self.assertEqual(logins, ['{"di_token": "x"}'])
+        self.assertEqual(sync.state['status'], 'connected')
+        self.assertTrue(sync.state['session_persisted'])
+        self.assertEqual(sync.state['storage_message'], FakeStore.saved_message)
+        self.assertTrue(sync.wake.is_set())
+
+    def test_unreadable_secure_storage_asks_for_sign_in(self):
+        sync = GarminSync(self.db, FakeStore(deny=True))
+        sync.restore()
+        self.assertIsNone(sync.client)
+        self.assertEqual(sync.state['status'], 'disconnected')
+        self.assertIn('sign in again', sync.state['message'])
+
+    def test_no_saved_session_stays_disconnected(self):
+        sync = GarminSync(self.db, FakeStore())
+        sync.restore()
+        self.assertIsNone(sync.client)
+        self.assertEqual(sync.state['status'], 'disconnected')
+
+    def test_memory_only_login_and_sync_keep_session_in_memory(self):
+        class AuthenticatedClient:
+            password = None
+            def __init__(self): self.client = self
+            def dumps(self): return '{}'
+            def get_activities(self, *args, **kwargs): return [activity(1)]
+
+        sync = GarminSync(self.db, MemoryOnlyStore())
+        client = AuthenticatedClient()
+        sync.finish_login(client)
+        self.assertEqual(sync.state['status'], 'connected')
+        self.assertTrue(sync.wake.is_set())
+        self.assertFalse(self.db.settings()['preview'])
+        sync.sync()
+        self.assertEqual(sync.state['status'], 'connected')
+        self.assertIs(sync.client, client)
+        self.assertEqual(len(self.db.list()), 1)
+        self.assertIsNotNone(sync.state['last_sync'])
+        self.assertFalse(sync.state['session_persisted'])
+        self.assertIn('sign in again', sync.state['storage_message'])
+        self.assertEqual(list(Path(self.tmp.name).glob('garmin-session*')), [])
 
     def test_paged_sync_and_offline_catchup_keep_notes(self):
         class FakeClient:
             def __init__(self): self.data=[activity(i) for i in range(230,0,-1)];self.client=self;self.calls=[]
             def get_activities(self,start,limit,**kw):self.calls.append(start);return self.data[start:start+limit]
             def dumps(self):return '{}'
-        sync=GarminSync(self.db);sync.client=FakeClient()
+        sync=GarminSync(self.db,FakeStore());sync.client=FakeClient()
         with patch('server.time.sleep'):
             sync.sync()
+        self.assertEqual(sync.store.saved,b'{}')
+        self.assertTrue(sync.state['session_persisted'])
         self.assertEqual(sync.state['status'],'connected')
         self.assertEqual(len(self.db.list()),230)
         self.assertEqual(sync.client.calls,[0,100,200])
@@ -117,7 +216,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(sync.state['imported'],150)
         self.assertEqual(self.db.get('garmin:220')['notes'],'Keep this')
         sync.disconnect()
-        self.assertFalse(sync.tokens.exists())
+        self.assertIsNone(sync.store.saved)
         self.assertEqual(len(self.db.list()),380)
 
     def test_failed_backfill_resumes_without_losing_old_pages(self):
@@ -128,7 +227,7 @@ class StorageTests(unittest.TestCase):
                 if start==100 and self.fail:raise ConnectionError('no network')
                 return [activity(i) for i in range(230,0,-1)][start:start+limit]
             def dumps(self):return '{}'
-        sync=GarminSync(self.db);sync.client=FakeClient()
+        sync=GarminSync(self.db,FakeStore());sync.client=FakeClient()
         with patch('server.time.sleep'):sync.sync()
         self.assertEqual(sync.state['status'],'error')
         self.assertFalse(self.db.settings().get('history_complete',False))
@@ -141,7 +240,7 @@ class StorageTests(unittest.TestCase):
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();db=Database(self.tmp.name)
-        self.server=AppServer(('127.0.0.1',0),db,GarminSync(db))
+        self.server=AppServer(('127.0.0.1',0),db,GarminSync(db,MemoryOnlyStore()))
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.port=self.server.server_address[1]
         _,headers,_=self.request('GET','/')
