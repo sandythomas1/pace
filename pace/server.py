@@ -510,7 +510,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.headers_safe():
             return self.send(403, {'error': 'PACE is available only on this computer.'})
         path = urlparse(self.path).path
-        static = {'/': 'index.html', '/app.js': 'app.js', '/metrics.js': 'metrics.js', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
+        static = {'/': 'index.html', '/app.js': 'app.js', '/metrics.js': 'metrics.js', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg', '/course.js': 'course.js', '/course-data.js': 'course-data.js', '/course-view.js': 'course-view.js', '/course.css': 'course.css', '/mission-inn-2026.jpg': 'mission-inn-2026.jpg'}
         if path in static:
             file = ROOT / 'static' / static[path]
             return self.send(200, file.read_bytes(), mimetypes.guess_type(file.name)[0] or 'text/plain', session=path == '/')

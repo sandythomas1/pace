@@ -163,6 +163,17 @@ class HttpTests(unittest.TestCase):
         code,_,body=self.request('GET','/api/state',headers=self.auth())
         self.assertEqual(code,200);self.assertEqual(json.loads(body)['runs'],[])
 
+    def test_course_assets_are_available_locally_without_relaxing_csp(self):
+        for path in ('/course.js', '/course-data.js', '/course-view.js', '/course.css', '/mission-inn-2026.jpg'):
+            code, headers, body = self.request('GET', path)
+            self.assertEqual(code, 200, path)
+            self.assertGreater(len(body), 50)
+            self.assertIn("connect-src 'self'", headers['Content-Security-Policy'])
+            self.assertIn("img-src 'self' data:", headers['Content-Security-Policy'])
+            if path.endswith('.jpg'):
+                self.assertEqual(headers['Content-Type'], 'image/jpeg')
+                self.assertTrue(body.startswith(b'\xff\xd8'))
+
     def test_cross_origin_and_missing_csrf_rejected(self):
         self.assertEqual(self.request('GET','/',headers={'Host':'attacker.example'})[0],403)
         self.assertEqual(self.request('POST','/api/settings',{'units':'km'},headers={'Cookie':self.cookie})[0],403)

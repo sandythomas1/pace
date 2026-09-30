@@ -21,6 +21,7 @@ An empty journal can display clearly labeled sample runs. These are generated in
 - Searchable run journal with personal notes, effort, run types, and shoes.
 - Progress charts and a training planner.
 - Editable race goals and pace calculations.
+- Mission Inn course companion: 2026 map with mile markers, pan/zoom, a separate 2024 elevation reference, target arrival times, and race-morning details. Open **Race day → Explore the course**.
 - Garmin syncing, manual entries, CSV/TCX/GPX imports, and JSON export/import.
 
 ## Architecture and data location
@@ -66,7 +67,7 @@ The server uses Python's HTTP server and SQLite; the frontend uses native JavaSc
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -v
-node --test tests/metrics.test.mjs
+node --test tests/*.test.mjs
 ```
 
 Node.js is needed only for the JavaScript tests. Tests use synthetic activities and temporary databases. A Windows DPAPI round-trip test may skip where the host cannot provide encryption; the memory-only failure path is also tested. Automated tests simulate Garmin integration: a real account sign-in is needed to verify current Garmin behavior.
@@ -74,3 +75,7 @@ Node.js is needed only for the JavaScript tests. Tests use synthetic activities 
 `requirements-lock.txt` pins the full runtime dependency set. Review dependency updates and audit the lock file before publishing a release. Review the exact files staged for Git and scan for secrets; ignore patterns and scanners are safeguards, not guarantees.
 
 Keep the server on loopback. LAN, tunnel, or cloud hosting would require a separate authentication and security design.
+
+## Mission Inn course sources
+
+The current organizer map and historical GPS data are bundled locally. No external map service is loaded. The 2024 reference reports about 397 ft of ascent; the 2026 total is not verified. Source links, version distinctions, and update instructions are in [the course companion notes](static/COURSE.md).
