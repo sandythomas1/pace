@@ -1,4 +1,5 @@
-"""Double-click Start PACE.cmd. No global packages or cloud services required."""
+"""Double-click Start PACE (.cmd on Windows, .command on macOS). No global packages or cloud services required."""
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import webbrowser
 
 root = Path(__file__).resolve().parent
 url = 'http://127.0.0.1:8765'
+windows = os.name == 'nt'
 
 def ready():
     try:
@@ -21,7 +23,7 @@ def main():
     if ready():
         webbrowser.open(url)
         return
-    runtime = root / '.venv' / 'Scripts' / 'python.exe'
+    runtime = root / '.venv' / ('Scripts/python.exe' if windows else 'bin/python')
     if not runtime.exists():
         print('Preparing PACE for this computer…')
         venv.create(root / '.venv', with_pip=True)
@@ -33,9 +35,11 @@ def main():
         subprocess.run([str(runtime), '-m', 'pip', 'install', '--disable-pip-version-check', '--retries', '1', '--timeout', '20', '--no-cache-dir', '-r', str(root / 'requirements-lock.txt')], check=True, timeout=240)
     logdir = root / '.data'
     logdir.mkdir(exist_ok=True)
+    # Detach so the server keeps running after the launcher window closes.
+    detach = {'creationflags': subprocess.CREATE_NO_WINDOW} if windows else {'start_new_session': True}
     with (logdir / 'server.log').open('ab') as log:
         subprocess.Popen([str(runtime), str(root / 'server.py')], cwd=root, stdin=subprocess.DEVNULL,
-                         stdout=log, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+                         stdout=log, stderr=log, **detach)
     for _ in range(40):
         if ready():
             webbrowser.open(url)

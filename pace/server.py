@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import errno
 import ctypes
 import hashlib
 import io
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -135,7 +137,7 @@ def normalize_garmin(a):
 def protect(data: bytes, decrypt=False):
     """Bind Garmin tokens to the signed-in Windows user using DPAPI."""
     if os.name != 'nt':
-        raise RuntimeError('Secure Garmin token storage requires Windows.')
+        raise OSError(errno.ENOTSUP, 'Secure Garmin token storage requires Windows.')
     from ctypes import wintypes
     class Blob(ctypes.Structure):
         _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_char))]
@@ -151,17 +153,128 @@ def protect(data: bytes, decrypt=False):
     finally:
         ctypes.windll.kernel32.LocalFree(out.pbData)
 
+class DpapiStore:
+    """Garmin session file encrypted for the signed-in Windows user."""
+    saved_message = 'Your Garmin session is encrypted for your Windows account.'
+
+    def __init__(self, path):
+        self.path = path
+
+    def save(self, raw: bytes):
+        encrypted = protect(raw)
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_bytes(encrypted)
+        tmp.replace(self.path)
+
+    def load(self):
+        return protect(self.path.read_bytes(), decrypt=True) if self.path.exists() else None
+
+    def clear(self):
+        self.path.unlink(missing_ok=True)
+
+class KeychainStore:
+    """Garmin session kept as a generic password in the macOS login Keychain."""
+    saved_message = 'Your Garmin session is saved in your macOS Keychain.'
+    service = b'PACE Garmin session'
+    not_found = -25300  # errSecItemNotFound
+
+    def __init__(self, account: str):
+        self.account = account.encode()
+        c_void_pp, c_uint32_p = ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint32)
+        sec = ctypes.CDLL('/System/Library/Frameworks/Security.framework/Security')
+        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        signatures = {
+            'SecKeychainFindGenericPassword': [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, c_uint32_p, c_void_pp, c_void_pp],
+            'SecKeychainAddGenericPassword': [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, c_void_pp],
+            'SecKeychainItemModifyAttributesAndData': [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p],
+            'SecKeychainItemFreeContent': [ctypes.c_void_p, ctypes.c_void_p],
+            'SecKeychainItemDelete': [ctypes.c_void_p],
+        }
+        for name, args in signatures.items():
+            getattr(sec, name).argtypes, getattr(sec, name).restype = args, ctypes.c_int32
+        cf.CFRelease.argtypes, cf.CFRelease.restype = [ctypes.c_void_p], None
+        self.sec, self.cf = sec, cf
+
+    @staticmethod
+    def check(status):
+        if status:
+            raise OSError(status, 'Could not access the macOS Keychain.')
+
+    def find(self, want_data=False):
+        """Return (item, data); item is None when no session is stored. Caller releases item."""
+        item, size, data = ctypes.c_void_p(), ctypes.c_uint32(), ctypes.c_void_p()
+        status = self.sec.SecKeychainFindGenericPassword(
+            None, len(self.service), self.service, len(self.account), self.account,
+            ctypes.byref(size) if want_data else None, ctypes.byref(data) if want_data else None, ctypes.byref(item))
+        if status == self.not_found:
+            return None, None
+        self.check(status)
+        if not want_data:
+            return item, None
+        try:
+            return item, ctypes.string_at(data, size.value)
+        finally:
+            self.sec.SecKeychainItemFreeContent(None, data)
+
+    def save(self, raw: bytes):
+        item, _ = self.find()
+        if item is None:
+            return self.check(self.sec.SecKeychainAddGenericPassword(
+                None, len(self.service), self.service, len(self.account), self.account, len(raw), raw, None))
+        try:
+            self.check(self.sec.SecKeychainItemModifyAttributesAndData(item, None, len(raw), raw))
+        finally:
+            self.cf.CFRelease(item)
+
+    def load(self):
+        item, data = self.find(want_data=True)
+        if item is not None:
+            self.cf.CFRelease(item)
+        return data
+
+    def clear(self):
+        item, _ = self.find()
+        if item is None:
+            return
+        try:
+            self.check(self.sec.SecKeychainItemDelete(item))
+        finally:
+            self.cf.CFRelease(item)
+
+class MemoryOnlyStore:
+    """No trusted OS secret storage: keep the session in memory and never write plaintext."""
+    saved_message = ''
+
+    def save(self, raw: bytes):
+        raise OSError(errno.ENOTSUP, 'Secure Garmin session storage is unavailable on this platform.')
+
+    def load(self):
+        return None
+
+    def clear(self):
+        pass
+
+def session_store(folder: Path):
+    if os.name == 'nt':
+        return DpapiStore(folder / 'garmin-session.dpapi')
+    if sys.platform == 'darwin':
+        try:
+            return KeychainStore(str(folder.resolve()))
+        except OSError:
+            logging.warning('macOS Keychain is unavailable; the Garmin session will stay in memory.')
+    return MemoryOnlyStore()
+
 class GarminSync:
     interval = 300
 
-    def __init__(self, db):
+    def __init__(self, db, store=None):
         self.db = db
         self.client = None
         self.pending = None
         self.pending_time = 0
         self.auth_lock = threading.Lock()
         self.wake = threading.Event()
-        self.tokens = db.folder / 'garmin-session.dpapi'
+        self.store = store or session_store(db.folder)
         self.state = {'status': 'disconnected', 'message': 'Connect Garmin to bring your runs home.',
                       'last_sync': db.settings().get('last_sync'), 'next_sync': None,
                       'imported': 0, 'interval_seconds': self.interval, 'session_persisted': False, 'storage_message': ''}
@@ -176,15 +289,11 @@ class GarminSync:
 
     def persist(self):
         try:
-            raw = self.client.client.dumps().encode()
-            encrypted = protect(raw)
-            tmp = self.tokens.with_suffix('.tmp')
-            tmp.write_bytes(encrypted)
-            tmp.replace(self.tokens)
-            self.state.update(session_persisted=True, storage_message='Your Garmin session is encrypted for your Windows account.')
+            self.store.save(self.client.client.dumps().encode())
+            self.state.update(session_persisted=True, storage_message=self.store.saved_message)
         except OSError:
-            # Restricted launch environments can deny DPAPI. Keep syncing in memory; never store plaintext.
-            self.state.update(session_persisted=False, storage_message='Secure session storage is unavailable in this launch. Sync works while PACE is running. Use Stop PACE, then Start PACE to try saving your sign-in securely.')
+            # OS secret storage can be unavailable or denied. Keep syncing in memory; never store plaintext.
+            self.state.update(session_persisted=False, storage_message='Secure session storage is unavailable on this computer. Sync works while PACE is running; sign in again after restarting PACE.')
 
     def begin_login(self, email, password):
         if not self.available:
@@ -328,23 +437,37 @@ class GarminSync:
         with self.auth_lock:
             self.client = None
             self.pending = None
-            self.tokens.unlink(missing_ok=True)
+            try:
+                self.store.clear()
+            except OSError:
+                logging.warning('Could not remove the saved Garmin session from secure storage.')
             self.wake.clear()
             self.db.save_settings({'history_complete': False, 'history_offset': 0})
             self.state.update(status='disconnected', next_sync=None, session_persisted=False, storage_message='', message='Garmin disconnected. Your saved runs are still here.')
 
+    def restore(self):
+        with self.auth_lock:
+            try:
+                saved = self.store.load()
+            except OSError:
+                self.state.update(message='Could not read your saved Garmin session from secure storage. Connect Garmin to sign in again.')
+                return
+            if not saved:
+                return
+            try:
+                from garminconnect import Garmin
+                self.client = Garmin()
+                self.client.login(saved.decode())
+                self.state.update(status='connected', message='Restored Garmin connection.',
+                                  session_persisted=True, storage_message=self.store.saved_message)
+                self.wake.set()
+            except Exception as e:
+                self.client = None
+                self.fail(e, login=True)
+
     def loop(self):
-        if self.tokens.exists() and self.available:
-            with self.auth_lock:
-                try:
-                    from garminconnect import Garmin
-                    self.client = Garmin()
-                    self.client.login(protect(self.tokens.read_bytes(), decrypt=True).decode())
-                    self.state.update(status='connected', message='Restored Garmin connection.')
-                    self.wake.set()
-                except Exception as e:
-                    self.client = None
-                    self.fail(e, login=True)
+        if self.available:
+            self.restore()
         while True:
             requested = self.wake.wait(2)
             self.wake.clear()
@@ -510,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.headers_safe():
             return self.send(403, {'error': 'PACE is available only on this computer.'})
         path = urlparse(self.path).path
-        static = {'/': 'index.html', '/app.js': 'app.js', '/metrics.js': 'metrics.js', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
+        static = {'/': 'index.html', '/app.js': 'app.js', '/metrics.js': 'metrics.js', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg', '/course.js': 'course.js', '/course-data.js': 'course-data.js', '/course-view.js': 'course-view.js', '/course.css': 'course.css', '/mission-inn-2026.jpg': 'mission-inn-2026.jpg'}
         if path in static:
             file = ROOT / 'static' / static[path]
             return self.send(200, file.read_bytes(), mimetypes.guess_type(file.name)[0] or 'text/plain', session=path == '/')
